@@ -1,0 +1,196 @@
+#!/bin/sh
+
+Prompt_Configuration() {
+    printf '\n'
+    printf '%s\n' '=== WR3000S FULL SETUP ==='
+    printf '\n'
+
+
+    # --------------------------------------------------------
+    # CURRENT ROOT PASSWORD
+    #
+    # Empty is deliberately allowed.
+    # Press ENTER on a fresh router.
+    # --------------------------------------------------------
+
+    if [[ -z "$CURRENT_ROOT_PASSWORD" ]]; then
+
+        read -r -s \
+            -p "Current router root password: " \
+            CURRENT_ROOT_PASSWORD
+
+        printf '\n'
+    fi
+
+
+    # --------------------------------------------------------
+    # NEW ROOT PASSWORD
+    # --------------------------------------------------------
+
+    if [[ -z "$ROOT_PASSWORD" ]]; then
+
+        read -r -s \
+            -p "New router root password: " \
+            ROOT_PASSWORD
+
+        printf '\n'
+
+        [[ -n "$ROOT_PASSWORD" ]] ||
+            Fail_With_Message \
+                "New router root password cannot be empty."
+
+        local ROOT_PASSWORD_CONFIRM
+
+        read -r -s \
+            -p "Confirm new router root password: " \
+            ROOT_PASSWORD_CONFIRM
+
+        printf '\n'
+
+        [[ "$ROOT_PASSWORD" == "$ROOT_PASSWORD_CONFIRM" ]] ||
+            Fail_With_Message \
+                "New root passwords do not match."
+
+        unset ROOT_PASSWORD_CONFIRM
+    fi
+
+
+    # --------------------------------------------------------
+    # WI-FI PASSWORDS
+    # --------------------------------------------------------
+
+    if [[ -z "$WIFI_24_PASSWORD" ]]; then
+
+        read -r -s \
+            -p "2.4 GHz Wi-Fi password: " \
+            WIFI_24_PASSWORD
+
+        printf '\n'
+    fi
+
+
+    if [[ -z "$WIFI_5_PASSWORD" ]]; then
+
+        read -r -s \
+            -p "5 GHz Wi-Fi password: " \
+            WIFI_5_PASSWORD
+
+        printf '\n'
+    fi
+
+
+    # --------------------------------------------------------
+    # AURORA
+    # --------------------------------------------------------
+
+    if [[ -z "$INSTALL_AURORA" ]]; then
+
+        local answer
+
+        read -r \
+            -p "Install Aurora LuCI theme? [Y/n]: " \
+            answer
+
+        case "$answer" in
+            n|N|no|NO)
+                INSTALL_AURORA=0
+                ;;
+            *)
+                INSTALL_AURORA=1
+                ;;
+        esac
+    fi
+
+
+    # --------------------------------------------------------
+    # CUSTOM SETUP
+    # --------------------------------------------------------
+
+    if (( INSTALL_AURORA == 0 )) &&
+       [[ -z "$CUSTOM_SETUP_URL" ]]; then
+
+        local answer
+
+        read -r \
+            -p "Run a custom LuCI/theme setup script instead? [y/N]: " \
+            answer
+
+        case "$answer" in
+            y|Y|yes|YES)
+
+                read -r \
+                    -p "Custom setup script URL: " \
+                    CUSTOM_SETUP_URL
+
+                [[ "$CUSTOM_SETUP_URL" =~ ^https?:// ]] ||
+                    Fail_With_Message \
+                        "Custom setup URL must start with http:// or https://."
+                ;;
+
+            *)
+                CUSTOM_SETUP_URL=""
+                ;;
+        esac
+    fi
+
+
+    # --------------------------------------------------------
+    # TAILSCALE
+    # --------------------------------------------------------
+
+    if [[ -z "$INSTALL_TAILSCALE" ]]; then
+
+        local answer
+
+        read -r \
+            -p "Install Tailscale? [Y/n]: " \
+            answer
+
+        case "$answer" in
+            n|N|no|NO)
+                INSTALL_TAILSCALE=0
+                ;;
+            *)
+                INSTALL_TAILSCALE=1
+                ;;
+        esac
+    fi
+
+
+    # --------------------------------------------------------
+    # TAILSCALE ROUTES
+    # --------------------------------------------------------
+
+    if (( INSTALL_TAILSCALE == 1 )) &&
+       [[ -z "$INSTALL_TAILSCALE_ROUTES" ]]; then
+
+        local answer
+
+        read -r \
+            -p "Advertise ${LAN_NET} through Tailscale? [Y/n]: " \
+            answer
+
+        case "$answer" in
+            n|N|no|NO)
+                INSTALL_TAILSCALE_ROUTES=0
+                ;;
+            *)
+                INSTALL_TAILSCALE_ROUTES=1
+                ;;
+        esac
+
+    elif (( INSTALL_TAILSCALE == 0 )); then
+
+        INSTALL_TAILSCALE_ROUTES=0
+    fi
+
+
+    export CURRENT_ROOT_PASSWORD
+
+    Validate_Configuration
+
+    printf '\n'
+
+    Print_Success \
+        "Configuration ready."
+}

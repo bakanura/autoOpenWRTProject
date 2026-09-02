@@ -1,0 +1,30 @@
+#!/bin/sh
+
+Configure_Tailscale_Routes() {
+    if (( INSTALL_TAILSCALE_ROUTES == 0 )); then
+
+        Print_Info \
+            "Tailscale subnet-route advertisement skipped."
+
+        return 0
+    fi
+
+
+    (( INSTALL_TAILSCALE == 1 )) ||
+        Fail_With_Message \
+            "Tailscale subnet-route advertisement was requested, but Tailscale installation is disabled."
+
+
+    Print_Info \
+        "Advertising $LAN_NET through Tailscale..."
+
+
+    Router_Ssh \
+        "tailscale set --advertise-routes=$(Shell_Quote "$LAN_NET")" ||
+        Fail_With_Message \
+            "Failed to configure Tailscale subnet-route advertisement."
+
+
+    Print_Success \
+        "Tailscale is advertising $LAN_NET."
+}

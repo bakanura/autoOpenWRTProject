@@ -1,18 +1,14 @@
 #!/bin/sh
 
 Prepare_Ssh() {
-    SSH_CONTROL_DIR="${XDG_RUNTIME_DIR:-/tmp}/openwrt-router-setup"
+    local runtime_parent="${XDG_RUNTIME_DIR:-/tmp}"
+    SSH_CONTROL_DIR="$(mktemp -d "$runtime_parent/openwrt-router-setup.XXXXXX")" ||
+        Fail_With_Message "Could not create private SSH working directory."
     SSH_CONTROL_SOCKET="$SSH_CONTROL_DIR/control"
     SSH_ASKPASS_FILE="$SSH_CONTROL_DIR/askpass"
     SSH_PASSWORD_FILE="$SSH_CONTROL_DIR/password"
 
-    mkdir -p "$SSH_CONTROL_DIR"
-
     chmod 700 "$SSH_CONTROL_DIR"
-
-    rm -f "$SSH_CONTROL_SOCKET"
-    rm -f "$SSH_ASKPASS_FILE"
-    rm -f "$SSH_PASSWORD_FILE"
 
 
     # --------------------------------------------------------
@@ -57,8 +53,8 @@ EOF
         -o ServerAliveInterval=15
         -o ServerAliveCountMax=3
         -o StrictHostKeyChecking=accept-new
-        -o PubkeyAuthentication=no
-        -o PreferredAuthentications=password,keyboard-interactive
+        -o PubkeyAuthentication=yes
+        -o PreferredAuthentications=publickey,password,keyboard-interactive
         -o ControlMaster=auto
         -o ControlPersist=300
         -o ControlPath="$SSH_CONTROL_SOCKET"

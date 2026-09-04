@@ -1,6 +1,16 @@
 #!/bin/sh
 
 Prompt_Configuration() {
+
+    echo "[INFO] Preset configuration:"
+    for v in INSTALL_HOME_ASSISTANT_IOT INSTALL_GUEST_WIFI INSTALL_ADGUARD_HOME INSTALL_SSH_AUTHORIZED_KEY SSH_KEY_ONLY INSTALL_TAILSCALE INSTALL_TAILSCALE_ROUTES INSTALL_TAILSCALE_LAN_ACCESS ALLOW_TAILSCALE_ROUTER_MANAGEMENT INSTALL_AURORA; do
+        eval "val=\${$v:-}"
+        [ -n "$val" ] && echo "[INFO] $v=$val"
+    done
+
+    # Respect exported environment variables
+    WIFI_COUNTRY="${WIFI_COUNTRY:-DE}"
+
     printf '\n'
     printf '%s\n' '=== WR3000S FULL SETUP ==='
     printf '\n'
@@ -89,26 +99,126 @@ Prompt_Configuration() {
         printf '\n'
     fi
 
+    # --------------------------------------------------------
+    # ISOLATED IOT / HOME ASSISTANT
+    # --------------------------------------------------------
+
+    if [[ -z "$INSTALL_HOME_ASSISTANT_IOT" ]]; then
+        local answer
+        read -r -p "Configure isolated IoT Wi-Fi and Home Assistant discovery? [Y/n]: " answer
+        case "$answer" in n|N|no|NO) INSTALL_HOME_ASSISTANT_IOT=0 ;; *) INSTALL_HOME_ASSISTANT_IOT=1 ;; esac
+    fi
+
+    if (( INSTALL_HOME_ASSISTANT_IOT == 1 )) && [[ -z "$HOME_ASSISTANT_IP" ]]; then
+        read -r -p "Home Assistant IPv4 address [192.168.8.125]: " HOME_ASSISTANT_IP
+        HOME_ASSISTANT_IP="${HOME_ASSISTANT_IP:-192.168.8.125}"
+    fi
+
+    if (( INSTALL_HOME_ASSISTANT_IOT == 1 )) && [[ -z "$IOT_WIFI_PASSWORD" ]]; then
+        read -r -p "Use the 2.4 GHz Wi-Fi password for IoT Wi-Fi? [Y/n]: " answer
+        case "$answer" in
+            n|N|no|NO)
+                read -r -s -p "IoT Wi-Fi password: " IOT_WIFI_PASSWORD
+                printf '\n'
+                [[ -n "$IOT_WIFI_PASSWORD" ]] || Fail_With_Message "IoT Wi-Fi password cannot be empty."
+                ;;
+            *) IOT_WIFI_PASSWORD="$WIFI_24_PASSWORD" ;;
+        esac
+    fi
+
+    # --------------------------------------------------------
+    # INTERNET-ONLY GUEST WI-FI
+    # --------------------------------------------------------
+
+    if [[ -z "$INSTALL_GUEST_WIFI" ]]; then
+        read -r -p "Configure an isolated internet-only guest Wi-Fi? [Y/n]: " answer
+        case "$answer" in n|N|no|NO) INSTALL_GUEST_WIFI=0 ;; *) INSTALL_GUEST_WIFI=1 ;; esac
+    fi
+
+    if (( INSTALL_GUEST_WIFI == 1 )) && [[ -z "$GUEST_WIFI_PASSWORD" ]]; then
+        read -r -p "Use the 2.4 GHz Wi-Fi password for guest Wi-Fi? [y/N]: " answer
+        case "$answer" in
+            y|Y|yes|YES) GUEST_WIFI_PASSWORD="$WIFI_24_PASSWORD" ;;
+            *)
+                read -r -s -p "Guest Wi-Fi password: " GUEST_WIFI_PASSWORD
+                printf '\n'
+                [[ -n "$GUEST_WIFI_PASSWORD" ]] || Fail_With_Message "Guest Wi-Fi password cannot be empty."
+                ;;
+        esac
+    fi
+
+    # --------------------------------------------------------
+    # ADGUARD HOME
+    # --------------------------------------------------------
+
+    if [[ -z "$INSTALL_ADGUARD_HOME" ]]; then
+        read -r -p "Install AdGuard Home for ads and phishing/malware blocking? [Y/n]: " answer
+        case "$answer" in n|N|no|NO) INSTALL_ADGUARD_HOME=0 ;; *) INSTALL_ADGUARD_HOME=1 ;; esac
+    fi
+
+    if (( INSTALL_ADGUARD_HOME == 1 )) && [[ -z "$ADGUARD_ADMIN_PASSWORD" ]]; then
+        read -r -s -p "AdGuard Home admin password: " ADGUARD_ADMIN_PASSWORD
+        printf '\n'
+        local ADGUARD_ADMIN_PASSWORD_CONFIRM
+        read -r -s -p "Confirm AdGuard Home admin password: " ADGUARD_ADMIN_PASSWORD_CONFIRM
+        printf '\n'
+        [[ "$ADGUARD_ADMIN_PASSWORD" == "$ADGUARD_ADMIN_PASSWORD_CONFIRM" ]] || Fail_With_Message "AdGuard Home passwords do not match."
+        unset ADGUARD_ADMIN_PASSWORD_CONFIRM
+    fi
+
+    if (( INSTALL_ADGUARD_HOME == 1 )) && [[ -z "$ENFORCE_ADGUARD_DNS" ]]; then
+        read -r -p "Redirect hard-coded LAN/IoT DNS requests through AdGuard? [Y/n]: " answer
+        case "$answer" in n|N|no|NO) ENFORCE_ADGUARD_DNS=0 ;; *) ENFORCE_ADGUARD_DNS=1 ;; esac
+    elif (( INSTALL_ADGUARD_HOME == 0 )); then
+        ENFORCE_ADGUARD_DNS=0
+    fi
+
+    # --------------------------------------------------------
+    # SSH PUBLIC KEY / OPTIONAL KEY-ONLY LOGIN
+    # --------------------------------------------------------
+
+    if [[ -z "$INSTALL_SSH_AUTHORIZED_KEY" ]]; then
+        if [[ -n "$AUTHORIZED_SSH_KEY" ]]; then
+            INSTALL_SSH_AUTHORIZED_KEY=1
+        else
+            read -r -p "Install an SSH public key for router login? [y/N]: " answer
+            case "$answer" in y|Y|yes|YES) INSTALL_SSH_AUTHORIZED_KEY=1 ;; *) INSTALL_SSH_AUTHORIZED_KEY=0 ;; esac
+        fi
+    fi
+
+    if (( INSTALL_SSH_AUTHORIZED_KEY == 1 )); then
+        if [[ -z "$AUTHORIZED_SSH_KEY" ]]; then
+            read -r -p "SSH public key: " AUTHORIZED_SSH_KEY
+            [[ -n "$AUTHORIZED_SSH_KEY" ]] || Fail_With_Message "SSH public key cannot be empty."
+        fi
+
+        if [[ -z "$SSH_KEY_ONLY" ]]; then
+            read -r -p "Disable SSH password login after installing the key? [y/N]: " answer
+            case "$answer" in y|Y|yes|YES) SSH_KEY_ONLY=1 ;; *) SSH_KEY_ONLY=0 ;; esac
+        fi
+    else
+        AUTHORIZED_SSH_KEY=""
+        SSH_KEY_ONLY="${SSH_KEY_ONLY:-0}"
+    fi
+
 
     # --------------------------------------------------------
     # AURORA
     # --------------------------------------------------------
 
-    if [[ -z "$INSTALL_AURORA" ]]; then
+    if [[ -z "${INSTALL_AURORA-}" ]]; then
 
         local answer
 
         read -r \
-            -p "Install Aurora LuCI theme? [Y/n]: " \
+            -p "Install optional Aurora LuCI theme? [y/N]: " \
             answer
 
         case "$answer" in
-            n|N|no|NO)
-                INSTALL_AURORA=0
-                ;;
-            *)
+            y|Y|yes|YES)
                 INSTALL_AURORA=1
                 ;;
+            *) INSTALL_AURORA=0 ;;
         esac
     fi
 
@@ -133,9 +243,13 @@ Prompt_Configuration() {
                     -p "Custom setup script URL: " \
                     CUSTOM_SETUP_URL
 
-                [[ "$CUSTOM_SETUP_URL" =~ ^https?:// ]] ||
+                [[ "$CUSTOM_SETUP_URL" =~ ^https:// ]] ||
                     Fail_With_Message \
-                        "Custom setup URL must start with http:// or https://."
+                        "Custom setup URL must use HTTPS."
+
+                read -r -p "Expected SHA-256 of the custom script: " CUSTOM_SETUP_SHA256
+                [[ "$CUSTOM_SETUP_SHA256" =~ ^[A-Fa-f0-9]{64}$ ]] ||
+                    Fail_With_Message "Custom setup SHA-256 must contain exactly 64 hexadecimal characters."
                 ;;
 
             *)
@@ -149,21 +263,19 @@ Prompt_Configuration() {
     # TAILSCALE
     # --------------------------------------------------------
 
-    if [[ -z "$INSTALL_TAILSCALE" ]]; then
+    if [[ -z "${INSTALL_TAILSCALE-}" ]]; then
 
         local answer
 
         read -r \
-            -p "Install Tailscale? [Y/n]: " \
+            -p "Install and configure Tailscale? [y/N]: " \
             answer
 
         case "$answer" in
-            n|N|no|NO)
-                INSTALL_TAILSCALE=0
-                ;;
-            *)
+            y|Y|yes|YES)
                 INSTALL_TAILSCALE=1
                 ;;
+            *) INSTALL_TAILSCALE=0 ;;
         esac
     fi
 
@@ -172,7 +284,7 @@ Prompt_Configuration() {
     # TAILSCALE LAN ACCESS / NETWORK DISCOVERY
     # --------------------------------------------------------
 
-    INSTALL_TAILSCALE_LAN_ACCESS="${INSTALL_TAILSCALE_LAN_ACCESS-}"
+    INSTALL_TAILSCALE_LAN_ACCESS="${INSTALL_TAILSCALE_LAN_ACCESS:-}"
     TAILSCALE_REMOTE_ROUTERS="${TAILSCALE_REMOTE_ROUTERS-}"
     TAILSCALE_REMOTE_ROUTER_IPS="${TAILSCALE_REMOTE_ROUTER_IPS-}"
 
@@ -180,79 +292,40 @@ Prompt_Configuration() {
 
         local answer
 
-        read -r \
-            -p "Allow Tailscale devices to access/discover this router's LAN (${LAN_NET})? [Y/n]: " \
-            answer
+        if [[ -z "${INSTALL_TAILSCALE_LAN_ACCESS-}" ]]; then
 
-        case "$answer" in
-            n|N|no|NO)
-                INSTALL_TAILSCALE_LAN_ACCESS=0
-                ;;
-            *)
-                INSTALL_TAILSCALE_LAN_ACCESS=1
-                ;;
-        esac
+            read -r \
+                -p "Allow Tailscale devices to access/discover this router's LAN (${LAN_NET})? [Y/n]: " \
+                answer
+
+            case "$answer" in
+                n|N|no|NO)
+                    INSTALL_TAILSCALE_LAN_ACCESS=0
+                    ;;
+                *)
+                    INSTALL_TAILSCALE_LAN_ACCESS=1
+                    ;;
+            esac
+
+        fi
+
+        if (( INSTALL_TAILSCALE_LAN_ACCESS == 1 )); then
+            if [[ -z "$ALLOW_TAILSCALE_ROUTER_MANAGEMENT" ]]; then
+                read -r -p "Allow Tailscale peers to administer this router itself? [y/N]: " answer
+                case "$answer" in y|Y|yes|YES) ALLOW_TAILSCALE_ROUTER_MANAGEMENT=1 ;; *) ALLOW_TAILSCALE_ROUTER_MANAGEMENT=0 ;; esac
+            fi
+        else
+            ALLOW_TAILSCALE_ROUTER_MANAGEMENT=0
+        fi
 
 
         # --------------------------------------------------------
         # REMOTE TAILSCALE ROUTERS
         # --------------------------------------------------------
 
-        if (( INSTALL_TAILSCALE_LAN_ACCESS == 1 )); then
-
-            read -r \
-                -p "Connect to other routers/LANs through Tailscale? [y/N]: " \
-                answer
-
-            case "$answer" in
-                y|Y|yes|YES)
-
-                    while true; do
-
-                        read -r \
-                            -p "How many remote Tailscale routers? " \
-                            TAILSCALE_REMOTE_ROUTERS
-
-                        [[ "$TAILSCALE_REMOTE_ROUTERS" =~ ^[1-9][0-9]*$ ]] &&
-                            break
-
-                        printf '%s\n' \
-                            "Please enter a positive whole number."
-                    done
-
-
-                    local i
-                    local remote_ip
-
-                    for (( i=1; i<=TAILSCALE_REMOTE_ROUTERS; i++ )); do
-
-                        while true; do
-
-                            read -r \
-                                -p "Remote router ${i} IPv4 address: " \
-                                remote_ip
-
-                            if Validate_Ip "$remote_ip"; then
-                                break
-                            fi
-
-                            printf '%s\n' \
-                                "Invalid IPv4 address."
-                        done
-
-                        if [[ -n "$TAILSCALE_REMOTE_ROUTER_IPS" ]]; then
-                            TAILSCALE_REMOTE_ROUTER_IPS+=" "
-                        fi
-
-                        TAILSCALE_REMOTE_ROUTER_IPS+="$remote_ip"
-                    done
-                    ;;
-
-                *)
-                    TAILSCALE_REMOTE_ROUTERS=0
-                    TAILSCALE_REMOTE_ROUTER_IPS=""
-                    ;;
-            esac
+        if [[ -z "$ENABLE_TAILSCALE_REMOTE_ROUTERS" ]]; then
+            read -r -p "Accept subnet routes advertised by other Tailscale routers? [y/N]: " answer
+            case "$answer" in y|Y|yes|YES) ENABLE_TAILSCALE_REMOTE_ROUTERS=1 ;; *) ENABLE_TAILSCALE_REMOTE_ROUTERS=0 ;; esac
         fi
 
 
@@ -260,7 +333,7 @@ Prompt_Configuration() {
         # OPTIONAL LOCAL LAN ADVERTISEMENT
         # --------------------------------------------------------
 
-        if [[ -z "$INSTALL_TAILSCALE_ROUTES" ]]; then
+        if [[ -z "${INSTALL_TAILSCALE_ROUTES-}" ]]; then
 
             if (( INSTALL_TAILSCALE_LAN_ACCESS == 1 )); then
                 INSTALL_TAILSCALE_ROUTES=1
@@ -277,8 +350,10 @@ Prompt_Configuration() {
 
         INSTALL_TAILSCALE_ROUTES=0
         INSTALL_TAILSCALE_LAN_ACCESS=0
+        ALLOW_TAILSCALE_ROUTER_MANAGEMENT=0
         TAILSCALE_REMOTE_ROUTERS=0
         TAILSCALE_REMOTE_ROUTER_IPS=""
+        ENABLE_TAILSCALE_REMOTE_ROUTERS=0
 
     fi
 

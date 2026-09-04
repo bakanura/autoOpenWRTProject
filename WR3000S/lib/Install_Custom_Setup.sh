@@ -10,9 +10,9 @@ Install_Custom_Setup() {
     fi
 
 
-    [[ "$CUSTOM_SETUP_URL" =~ ^https?:// ]] ||
+    [[ "$CUSTOM_SETUP_URL" =~ ^https:// ]] ||
         Fail_With_Message \
-            "Custom setup URL must start with http:// or https://."
+            "Custom setup URL must use HTTPS."
 
 
     printf '\n'
@@ -63,6 +63,7 @@ Install_Custom_Setup() {
 set -e
 
 URL=$(Shell_Quote "$CUSTOM_SETUP_URL")
+EXPECTED_SHA256=$(Shell_Quote "$CUSTOM_SETUP_SHA256")
 
 tmp=\$(mktemp)
 
@@ -78,6 +79,12 @@ trap cleanup EXIT INT TERM
 wget \
     -O "\$tmp" \
     "\$URL"
+
+actual_sha256=\$(sha256sum "\$tmp" | awk '{print \$1}')
+[ "\$actual_sha256" = "\$EXPECTED_SHA256" ] || {
+    echo "Custom setup SHA-256 mismatch" >&2
+    exit 1
+}
 
 
 chmod 700 "\$tmp"

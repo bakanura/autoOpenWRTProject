@@ -1,0 +1,199 @@
+#!/bin/sh
+
+VERBOSE=0
+RESOURCES=0
+for argument in "$@"; do
+    case "$argument" in
+        --verbose) VERBOSE=1 ;;
+        --resources) RESOURCES=1 ;;
+        *) echo "Usage: network-audit [--verbose] [--resources]" >&2; exit 1 ;;
+    esac
+done
+
+FAILURES=0
+pass() { echo "PASS: $*"; }
+warn() { echo "WARN: $*"; }
+fail() { echo "FAIL: $*"; FAILURES=$((FAILURES + 1)); }
+sections() { uci show "$1" 2>/dev/null | sed -n "s/^$1\.\([^.=]*\)=$2$/\1/p"; }
+option() { uci -q get "$1.$2.$3" 2>/dev/null; }
+has_port() {
+    wanted=$1; shift
+    for listed in $*; do [ "$listed" = "$wanted" ] && return 0; done
+    return 1
+}
+
+echo "=== NETWORK SECURITY AUDIT ==="
+echo
+
+if fw4 check >/dev/null 2>&1; then pass "fw4 configuration valid"; else fail "fw4 configuration invalid"; fi
+[ "$(uci -q get firewall.@defaults[0].syn_flood)" = 1 ] && pass "SYN flood protection enabled" || fail "SYN flood protection disabled"
+
+IOT_ZONE=''
+GUEST_ZONE=''
+WAN_ZONE=''
+for section in $(sections firewall zone); do
+    case "$(option firewall "$section" name)" in iot) IOT_ZONE=$section ;; guest) GUEST_ZONE=$section ;; wan) WAN_ZONE=$section ;; esac
+done
+[ -n "$WAN_ZONE" ] && { [ "$(option firewall "$WAN_ZONE" input)" = DROP ] || [ "$(option firewall "$WAN_ZONE" input)" = REJECT ]; } && pass "WAN router input is restricted" || fail "WAN router input is not restricted"
+if [ -n "$IOT_ZONE" ]; then
+    [ "$(option firewall "$IOT_ZONE" input)" = REJECT ] && pass "IoT INPUT default is REJECT" || fail "IoT INPUT default is not REJECT"
+    [ "$(option firewall "$IOT_ZONE" forward)" = REJECT ] && pass "IoT FORWARD default is REJECT" || fail "IoT FORWARD default is not REJECT"
+else
+    echo "INFO: Optional IoT/Home Assistant integration is not configured"
+fi
+if [ -n "$GUEST_ZONE" ]; then
+    [ "$(option firewall "$GUEST_ZONE" input)" = REJECT ] && pass "Guest INPUT default is REJECT" || fail "Guest INPUT default is not REJECT"
+    [ "$(option firewall "$GUEST_ZONE" forward)" = REJECT ] && pass "Guest FORWARD default is REJECT" || fail "Guest FORWARD default is not REJECT"
+else
+    echo "INFO: Optional guest Wi-Fi is not configured"
+fi
+
+IOT_WAN=0; IOT_LAN=0
+for section in $(sections firewall forwarding); do
+    [ "$(option firewall "$section" src)" = iot ] || continue
+    case "$(option firewall "$section" dest)" in wan) IOT_WAN=1 ;; lan) IOT_LAN=1 ;; esac
+done
+[ "$IOT_WAN" -eq 0 ] && pass "No global IoT -> WAN forwarding" || fail "Global IoT -> WAN forwarding exists"
+[ "$IOT_LAN" -eq 0 ] && pass "No global IoT -> LAN forwarding" || fail "Global IoT -> LAN forwarding exists"
+
+GUEST_WAN=0; GUEST_PRIVATE=0
+for section in $(sections firewall forwarding); do
+    [ "$(option firewall "$section" src)" = guest ] || continue
+    case "$(option firewall "$section" dest)" in wan) GUEST_WAN=1 ;; *) GUEST_PRIVATE=1 ;; esac
+done
+if [ -n "$GUEST_ZONE" ]; then
+    [ "$GUEST_WAN" -eq 1 ] && pass "Guest has internet forwarding" || fail "Guest has no WAN forwarding"
+    [ "$GUEST_PRIVATE" -eq 0 ] && pass "Guest has no LAN/IoT forwarding" || fail "Guest can forward to a non-WAN zone"
+    [ "$(uci -q get wireless.guest_ap.isolate)" = 1 ] && pass "Guest client isolation enabled" || fail "Guest client isolation disabled"
+fi
+
+DIRECT_MDNS=0; WAN_MGMT=0; WAN_DNS=0; HA_BAD=0; MDNS_BAD=0; INTERNET_BAD=0; DHCP_WARN=0
+for section in $(sections firewall redirect); do
+    [ "$(option firewall "$section" src)" = wan ] || continue
+    ports="$(option firewall "$section" src_dport) $(option firewall "$section" dest_port)"
+    for port in 22 80 443 8080; do has_port "$port" "$ports" && WAN_MGMT=1; done
+    has_port 53 "$ports" && WAN_DNS=1
+done
+for section in $(sections firewall rule); do
+    name="$(option firewall "$section" name)"
+    src="$(option firewall "$section" src)"
+    dest="$(option firewall "$section" dest)"
+    proto="$(option firewall "$section" proto)"
+    ports="$(option firewall "$section" dest_port)"
+    target="$(option firewall "$section" target)"
+    if [ "$src" = iot ] && [ "$dest" = lan ] && has_port 5353 "$ports"; then DIRECT_MDNS=1; fi
+    if [ "$src" = wan ] && [ "$target" = ACCEPT ]; then
+        for port in 22 80 443 8080; do has_port "$port" "$ports" && WAN_MGMT=1; done
+        has_port 53 "$ports" && WAN_DNS=1
+    fi
+    case "$name" in
+        *-IoT-HAOS01)
+            src_ip="$(option firewall "$section" src_ip)"; src_mac="$(option firewall "$section" src_mac)"
+            dest_ip="$(option firewall "$section" dest_ip)"
+            [ "$src" = iot ] && [ -n "$src_ip" ] && [ -n "$src_mac" ] && [ "$dest" = lan ] && [ -n "$dest_ip" ] && [ "$proto" = tcp ] && has_port 8123 "$ports" || HA_BAD=1
+            reservation_ok=0
+            for host in $(sections dhcp host); do
+                host_ip="$(option dhcp "$host" ip)"; host_mac="$(option dhcp "$host" mac | tr '[:lower:]' '[:upper:]')"
+                rule_mac="$(printf '%s' "$src_mac" | tr '[:lower:]' '[:upper:]')"
+                [ "$host_ip" = "$src_ip" ] && [ "$host_mac" = "$rule_mac" ] && reservation_ok=1
+            done
+            [ "$reservation_ok" -eq 1 ] || DHCP_WARN=1
+            ;;
+        *-IoT-mDNS-to-Avahi)
+            [ "$src" = iot ] && [ -n "$(option firewall "$section" src_ip)" ] && [ -n "$(option firewall "$section" src_mac)" ] && [ "$proto" = udp ] && [ "$(option firewall "$section" dest_ip)" = 224.0.0.251 ] && has_port 5353 "$ports" && [ -z "$dest" ] || MDNS_BAD=1
+            ;;
+        *-IoT-Internet)
+            [ "$src" = iot ] && [ -n "$(option firewall "$section" src_ip)" ] && [ -n "$(option firewall "$section" src_mac)" ] && [ "$dest" = wan ] && [ "$target" = ACCEPT ] || INTERNET_BAD=1
+            ;;
+    esac
+done
+[ "$DIRECT_MDNS" -eq 0 ] && pass "No direct IoT -> LAN mDNS forwarding" || fail "Direct IoT -> LAN mDNS forwarding exists"
+[ "$HA_BAD" -eq 0 ] && pass "Home Assistant device rules use scoped IP + MAC matching" || fail "A Home Assistant rule is incomplete or broad"
+[ "$MDNS_BAD" -eq 0 ] && pass "Managed mDNS rules target router Avahi" || fail "A managed mDNS rule is incomplete or forwarded"
+[ "$INTERNET_BAD" -eq 0 ] && pass "IoT internet exceptions use scoped IP + MAC matching" || fail "An IoT internet exception is incomplete or broad"
+[ "$DHCP_WARN" -eq 0 ] && pass "Managed-device DHCP reservations are consistent" || warn "A managed rule has no matching DHCP reservation"
+
+if [ -n "$IOT_ZONE" ]; then
+    if /etc/init.d/avahi-daemon status >/dev/null 2>&1; then pass "Avahi daemon is running"; else fail "Avahi daemon is not running"; fi
+    if [ "$(sed -n 's/^[[:space:]]*allow-interfaces=//p' /etc/avahi/avahi-daemon.conf 2>/dev/null)" = 'br-lan,phy0-ap1' ]; then pass "Avahi restricted to br-lan,phy0-ap1"; else fail "Avahi interface scope differs from br-lan,phy0-ap1"; fi
+    grep -Eq '^[[:space:]]*enable-reflector=yes[[:space:]]*$' /etc/avahi/avahi-daemon.conf 2>/dev/null && pass "Avahi reflector enabled" || fail "Avahi reflector disabled"
+    grep -Eq '^[[:space:]]*reflect-ipv=no[[:space:]]*$' /etc/avahi/avahi-daemon.conf 2>/dev/null && pass "Cross-family reflection disabled" || fail "Avahi reflect-ipv is not disabled"
+fi
+
+[ "$WAN_MGMT" -eq 0 ] && pass "No explicit WAN SSH/LuCI/admin ACCEPT rule" || fail "WAN firewall explicitly accepts a management port"
+[ "$WAN_DNS" -eq 0 ] && pass "DNS not explicitly exposed from WAN" || fail "WAN firewall explicitly accepts DNS"
+
+if [ -x /etc/init.d/miniupnpd ] && /etc/init.d/miniupnpd running >/dev/null 2>&1; then
+    fail "UPnP/NAT-PMP service is active"
+else
+    pass "UPnP/NAT-PMP is not active"
+fi
+
+if [ -x /etc/init.d/adguardhome ]; then
+    /etc/init.d/adguardhome running && pass "AdGuard Home is running" || fail "AdGuard Home is installed but not running"
+    [ "$(uci -q get dhcp.@dnsmasq[0].port)" = 54 ] && pass "dnsmasq DNS moved to local port 54" || fail "dnsmasq conflicts with AdGuard port 53"
+    grep -Eq '^[[:space:]]*protection_enabled:[[:space:]]*true' /etc/adguardhome/adguardhome.yaml 2>/dev/null && pass "AdGuard protection enabled" || fail "AdGuard protection disabled"
+    grep -Eq '^[[:space:]]*filtering_enabled:[[:space:]]*true' /etc/adguardhome/adguardhome.yaml 2>/dev/null && pass "AdGuard filter processing enabled" || fail "AdGuard filter processing disabled"
+fi
+
+[ "$(uci -q get uhttpd.main.redirect_https)" = 1 ] && pass "LuCI redirects HTTP to HTTPS" || warn "LuCI HTTPS redirection is disabled"
+[ "$(uci -q get uhttpd.main.rfc1918_filter)" = 1 ] && pass "uHTTPd RFC1918 host filtering enabled" || fail "uHTTPd RFC1918 host filtering disabled"
+
+WEAK_WIFI=0
+for section in $(sections wireless wifi-iface); do
+    encryption="$(option wireless "$section" encryption)"
+    case "$encryption" in none|wep|wep-open|wep-shared|psk) WEAK_WIFI=1 ;; esac
+done
+[ "$WEAK_WIFI" -eq 0 ] && pass "No open, WEP, or WPA1-only Wi-Fi configured" || fail "Weak Wi-Fi encryption is configured"
+
+DROPBEAR_SECTION="$(sections dropbear dropbear | sed -n '1p')"
+if [ -n "$DROPBEAR_SECTION" ]; then
+    interface="$(option dropbear "$DROPBEAR_SECTION" Interface)"
+    if [ "$interface" = lan ]; then
+        pass "Dropbear is bound to LAN"
+    elif [ -z "$interface" ] && [ "$(uci -q get firewall.tailscale.input)" = ACCEPT ]; then
+        pass "Dropbear uses firewall isolation for explicit LAN/Tailscale management"
+    else
+        warn "Dropbear Interface is ${interface:-all interfaces}; firewall isolation is required"
+    fi
+    [ "$(option dropbear "$DROPBEAR_SECTION" GatewayPorts)" != 1 ] && pass "Dropbear GatewayPorts disabled" || fail "Dropbear GatewayPorts enabled"
+    echo "INFO: Dropbear PasswordAuth=$(option dropbear "$DROPBEAR_SECTION" PasswordAuth), RootPasswordAuth=$(option dropbear "$DROPBEAR_SECTION" RootPasswordAuth)"
+else
+    fail "Dropbear configuration not found"
+fi
+
+IOT_WIFI=''
+for section in $(sections wireless wifi-iface); do [ "$(option wireless "$section" network)" = iot ] && IOT_WIFI=$section; done
+if [ -n "$IOT_ZONE" ]; then
+    if [ -n "$IOT_WIFI" ] && [ -z "$(option wireless "$IOT_WIFI" macfilter)" ] && [ -z "$(option wireless "$IOT_WIFI" maclist)" ]; then pass "IoT Wi-Fi MAC filtering disabled"; else fail "IoT Wi-Fi missing or MAC filtering configured"; fi
+fi
+
+if [ "$VERBOSE" -eq 1 ]; then
+    echo
+    echo "--- LISTENERS ---"
+    if command -v ss >/dev/null 2>&1; then ss -lntu; else warn "ss is unavailable"; fi
+    echo "Dropbear interface: ${interface:-unknown}"
+    echo "dnsmasq localservice: $(uci -q get dhcp.@dnsmasq[0].localservice)"
+    echo "2.4 GHz legacy_rates: $(uci -q get wireless.radio0.legacy_rates)"
+    bridge_section=''
+    for section in $(sections network device); do [ "$(option network "$section" name)" = br-lan ] && bridge_section=$section; done
+    echo "LAN IGMP snooping: $(option network "$bridge_section" igmp_snooping)"
+fi
+
+if [ "$RESOURCES" -eq 1 ]; then
+    echo
+    echo "--- STORAGE AND MEMORY ---"
+    df -h /overlay /rom 2>/dev/null || df -h /
+    echo
+    free 2>/dev/null || sed -n '1,5p' /proc/meminfo
+    echo
+    echo "Installed feature footprints:"
+    for resource_path in /usr/bin/AdGuardHome /var/lib/adguardhome /usr/sbin/tailscaled /usr/sbin/network-audit; do
+        [ -e "$resource_path" ] && du -sh "$resource_path" 2>/dev/null
+    done
+fi
+
+echo
+if [ "$FAILURES" -eq 0 ]; then echo "RESULT: PASS"; exit 0; fi
+echo "RESULT: FAIL ($FAILURES required checks failed)"
+exit 1

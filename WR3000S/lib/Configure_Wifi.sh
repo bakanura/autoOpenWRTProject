@@ -5,7 +5,6 @@ Configure_Wifi() {
 
     local remote_script
     remote_script="$(mktemp)"
-
     cat > "$remote_script" <<'REMOTE'
 #!/bin/sh
 set -e
@@ -14,92 +13,47 @@ set -e
 : "${WIFI_24_PASSWORD:?Missing WIFI_24_PASSWORD}"
 : "${WIFI_5_SSID:?Missing WIFI_5_SSID}"
 : "${WIFI_5_PASSWORD:?Missing WIFI_5_PASSWORD}"
+: "${WIFI_COUNTRY:?Missing WIFI_COUNTRY}"
 
-configure_radio() {
-    radio="$1"
-    ssid="$2"
-    password="$3"
+configure_lan_ap() {
+    radio=$1
+    ssid=$2
+    password=$3
+    configured=0
 
     uci set "wireless.$radio.disabled=0"
     uci set "wireless.$radio.country=$WIFI_COUNTRY"
 
-    for iface in $(uci show wireless 2>/dev/null |
-        sed -n 's/^wireless\.\([^=]*\)=wifi-iface$/\1/p'); do
-
-        device="$(uci -q get "wireless.$iface.device" 2>/dev/null || true)"
-
-        [ "$device" = "$radio" ] || continue
-
-        uci set "wireless.$iface.ssid=$ssid"
-        uci set "wireless.$iface.encryption=sae-mixed"
-        uci set "wireless.$iface.key=$password"
+    for wifi_section in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.=]*\)=wifi-iface$/\1/p'); do
+        [ "$(uci -q get "wireless.$wifi_section.device")" = "$radio" ] || continue
+        [ "$(uci -q get "wireless.$wifi_section.network")" = 'lan' ] || continue
+        uci set "wireless.$wifi_section.ssid=$ssid"
+        uci set "wireless.$wifi_section.encryption=sae-mixed"
+        uci set "wireless.$wifi_section.key=$password"
+        uci set "wireless.$wifi_section.disabled=0"
+        configured=1
     done
+
+    [ "$configured" -eq 1 ] || {
+        echo "No LAN access point found on $radio" >&2
+        return 1
+    }
 }
 
-configure_radio radio0 "$WIFI_24_SSID" "$WIFI_24_PASSWORD"
+configure_lan_ap radio0 "$WIFI_24_SSID" "$WIFI_24_PASSWORD"
 iw reg set "$WIFI_COUNTRY" 2>/dev/null || true
 
-    wifi_5_channel=""
-    wifi_5_power="0"
-
-    while read -r channel power flags; do
-        [ -n "$channel" ] || continue
-        [ -n "$power" ] || continue
-
-        case "$flags" in
-            *radar*|*NO-IR*|*disabled*)
-                continue
-                ;;
-        esac
-
-        case "$channel" in
-            36|40|44|48|52|56|60|64|100|104|108|112|116|120|124|128|132|136|140|144|149|153|157|161|165)
-                ;;
-            *)
-                continue
-                ;;
-        esac
-
-        if awk "BEGIN { exit !($power > $wifi_5_power) }"; then
-            wifi_5_channel="$channel"
-            wifi_5_power="$power"
-        fi
-    done < <(
-        iw phy phy1 info 2>/dev/null |
-        awk '
-            /MHz \[[0-9]+\]/ {
-                channel=""
-                power=""
-                flags=$0
-
-                if (match($0, /\[[0-9]+\]/))
-                    channel=substr($0, RSTART + 1, RLENGTH - 2)
-
-                if (match($0, /\(([0-9]+\.[0-9]+) dBm\)/))
-                    power=substr($0, RSTART + 1, RLENGTH - 6)
-
-                if (channel != "" && power != "")
-                    printf "%s %s %s\n", channel, power, flags
-            }
-        '
-    )
-
-    if [ -z "$wifi_5_channel" ]; then
-        wifi_5_channel="36"
-        uci -q delete wireless.radio1.txpower
-    else
-        uci set wireless.radio1.txpower="$wifi_5_power"
-    fi
-
-    uci set wireless.radio1.channel="$wifi_5_channel"
-    uci set wireless.radio1.htmode="HE80"
-
-    printf 'Selected 5 GHz channel: %s (maximum legal power: %s dBm)\n'         "$wifi_5_channel" "$wifi_5_power"
-
-    configure_radio radio1 "$WIFI_5_SSID" "$WIFI_5_PASSWORD"
+# A fixed non-DFS HE80 channel is more reliable during initial boot than
+# deriving a primary channel from driver power output. Regulatory power stays
+# under driver control.
+uci set wireless.radio1.channel='36'
+uci set wireless.radio1.htmode='HE80'
+uci -q delete wireless.radio1.txpower
+configure_lan_ap radio1 "$WIFI_5_SSID" "$WIFI_5_PASSWORD"
 
 uci commit wireless
 wifi reload
+wifi up
 REMOTE
 
     if ! Router_Ssh \
@@ -107,14 +61,43 @@ REMOTE
          WIFI_24_PASSWORD=$(Shell_Quote "$WIFI_24_PASSWORD") \
          WIFI_5_SSID=$(Shell_Quote "$WIFI_5_SSID") \
          WIFI_5_PASSWORD=$(Shell_Quote "$WIFI_5_PASSWORD") \
+         WIFI_COUNTRY=$(Shell_Quote "$WIFI_COUNTRY") \
          sh -s" < "$remote_script"; then
-
         rm -f "$remote_script"
-        Print_Error "Failed to configure Wi-Fi."
-        return 1
+        Fail_With_Message "Failed to configure Wi-Fi."
     fi
 
     rm -f "$remote_script"
+    Print_Success "Wi-Fi configuration committed and startup requested."
+}
 
-    Print_Info "Wi-Fi configured."
+Verify_Wifi_Active() {
+    Print_Info "Verifying Wi-Fi radios and access points are active..."
+
+    if ! Router_Ssh \
+        "EXPECTED_WIFI_24_SSID=$(Shell_Quote "$WIFI_24_SSID") \
+         EXPECTED_WIFI_5_SSID=$(Shell_Quote "$WIFI_5_SSID") \
+         EXPECTED_IOT_WIFI_SSID=$(Shell_Quote "$IOT_WIFI_SSID") \
+         EXPECT_IOT_WIFI=$(Shell_Quote "$INSTALL_HOME_ASSISTANT_IOT") \
+         EXPECTED_GUEST_WIFI_SSID=$(Shell_Quote "$GUEST_WIFI_SSID") \
+         EXPECT_GUEST_WIFI=$(Shell_Quote "$INSTALL_GUEST_WIFI") \
+         sh -s" <<'REMOTE'
+set -e
+[ "$(uci -q get wireless.radio0.disabled)" = '0' ]
+[ "$(uci -q get wireless.radio1.disabled)" = '0' ]
+[ "$EXPECT_IOT_WIFI" = '0' ] || [ "$(uci -q get wireless.iot_ap.disabled)" = '0' ]
+[ "$EXPECT_GUEST_WIFI" = '0' ] || [ "$(uci -q get wireless.guest_ap.disabled)" = '0' ]
+wifi up
+[ "$(ubus call network.wireless status | jsonfilter -e '@.radio0.up')" = 'true' ]
+[ "$(ubus call network.wireless status | jsonfilter -e '@.radio1.up')" = 'true' ]
+iwinfo 2>/dev/null | grep -Fq "ESSID: \"$EXPECTED_WIFI_24_SSID\""
+iwinfo 2>/dev/null | grep -Fq "ESSID: \"$EXPECTED_WIFI_5_SSID\""
+[ "$EXPECT_IOT_WIFI" = '0' ] || iwinfo 2>/dev/null | grep -Fq "ESSID: \"$EXPECTED_IOT_WIFI_SSID\""
+[ "$EXPECT_GUEST_WIFI" = '0' ] || iwinfo 2>/dev/null | grep -Fq "ESSID: \"$EXPECTED_GUEST_WIFI_SSID\""
+REMOTE
+    then
+        Fail_With_Message "Wi-Fi is configured but one or more access points did not start."
+    fi
+
+    Print_Success "Both radios and all configured access points are active."
 }
